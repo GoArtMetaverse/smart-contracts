@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import {ERC20Pausable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Pausable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+
+contract GoArtToken is ERC20, ERC20Burnable, ERC20Pausable, AccessControl {
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    uint256 public constant MAX_SUPPLY = 3_000_000_000 * 10 ** 18;
+
+    constructor(
+        string memory name,
+        string memory symbol,
+        address defaultAdmin,
+        address treasuryWallet
+    ) ERC20(name, symbol) {
+        _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
+        _grantRole(ADMIN_ROLE, defaultAdmin);
+        _mint(treasuryWallet, MAX_SUPPLY);
+    }
+
+    function mint(
+        address to,
+        uint256 amount
+    ) public onlyRole(ADMIN_ROLE) whenNotPaused {
+        require(
+            totalSupply() + amount <= MAX_SUPPLY,
+            "Minting would exceed max supply"
+        );
+        _mint(to, amount);
+    }
+
+    function burn(
+        uint256 amount
+    ) public override onlyRole(ADMIN_ROLE) whenNotPaused {
+        super.burn(amount);
+    }
+
+    function pause() public onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() public onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    function _update(
+        address from,
+        address to,
+        uint256 value
+    ) internal override(ERC20, ERC20Pausable) {
+        super._update(from, to, value);
+    }
+}
