@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// @title GoArtVesting
+/// @notice This contract manages token vesting schedules based on predefined phases.
+/// Administrators (ADMIN_ROLE) can create phases, set vesting schedules, and revoke them.
+/// Beneficiaries can claim tokens as they vest over time.
+contract GoArtVesting is AccessControl, Pausable, ReentrancyGuard {
+	using SafeERC20 for IERC20;
+
+	// -----------------------------------------
+	// Type Declarations
+	// -----------------------------------------
+
+	/// @notice Status of a vesting schedule
+	enum Status {
+		INITIALIZED,
+		REVOKED
+	}
+
+	/// @notice Represents a single vesting schedule
+	struct VestingSchedule {
+		address beneficiary;        /// Address of the beneficiary
+		uint256 amountToVest;       /// Total tokens allocated for vesting
+		uint256 claimedAmount;      /// Tokens already claimed by the beneficiary
+		uint256 phaseId;            /// Phase ID associated with this vesting schedule
+		Status status;              /// Current status of the schedule (INITIALIZED/REVOKED)
+		bool revocable;             /// Indicates if the schedule is revocable
+		bool tgeEligible;           /// Indicates if the schedule includes a TGE allocation
+	}
+
+	/// @notice Represents a phase of vesting with specific rules
+	struct Phase {
+		string name;                     /// Name of the phase
+		uint256 cliff;                   /// Duration of the cliff (in seconds)
+		uint256 duration;                /// Total duration of the phase (in seconds)
+		uint256 slicePeriodSeconds;      /// Duration of each vesting slice (in seconds)
+		uint256 tgePercentage;           /// Percentage of tokens released at TGE
+		uint256 vestingPercentagePerSlice; /// Percentage of tokens released per slice
+		bool saleStatus;                 /// Whether the phase is currently active
+	}
+
+	// -----------------------------------------
+	// State Variables
+	// -----------------------------------------
+
+	bytes32 public constant CONTRACT_MANAGER_ROLE = keccak256("CONTRACT_MANAGER_ROLE");
+	bytes32 public constant PHASE_MANAGER_ROLE = keccak256("PHASE_MANAGER_ROLE");
+	bytes32 public constant VESTING_MANAGER_ROLE = keccak256("CREATE_VESTING_SCHEDULE_ROLE");
+
+	IERC20 public token;                     /// The token being vested
+	address public treasuryWallet;           /// Treasury wallet holding the tokens
+	uint256 public vestingSchedulesTotalAmount; /// Total tokens allocated for vesting
+	bool public tokenLaunch;                 /// Indicates if token launch has occurred
+	uint256 public tokenLaunchTime;          /// Timestamp of the token launch
+	uint256 public activeSalePhaseId;        /// ID of the currently active sale phase
+
+	bytes32[] public vestingSchedulesIds;    /// List of all vesting schedule IDs
+	mapping(bytes32 => VestingSchedule) public vestingSchedules; /// Maps schedule IDs to their details
+	mapping(uint256 => Phase) public phases; /// Maps phase IDs to their details
+
+	// -----------------------------------------
+	// Events
+	// -----------------------------------------
+
+	event TokenLaunched(uint256 launchTime);
+	event VestingScheduleCreated(
+		bytes32 indexed scheduleId,
+		address indexed beneficiary,
+		uint256 amountToVest,
+		uint256 phaseId,
+		bool revocable
+	);
+	event VestingScheduleRevoked(bytes32 indexed scheduleId, address indexed beneficiary);
+	event PhaseCreated(
+		uint256 indexed phaseId,
+		string name,
+		uint256 cliff,
+		uint256 duration,
+		uint256 slicePeriodSeconds,
+		uint256 tgePercentage,
+		uint256 vestingPercentagePerSlice
+	);
+	event PhaseSaleStatusUpdated(uint256 indexed phaseId, bool saleStatus);
+	event TokensClaimed(
+		bytes32 indexed scheduleId,
+		address indexed beneficiary,
+		uint256 amount
+	);
+
+	// -----------------------------------------
+	// Errors
+	// -----------------------------------------
+
+	error InsufficientClaimableTokens();
+	error InvalidAmount();
+	error InvalidSlicePeriod();
+	error DurationShorterThanCliff();
+	error NotRevocable();
+	error Unauthorized();
+	error VestingScheduleWasRevoked();
+	error PhaseAlreadyExists();
+	error PhaseDoesNotExist();
+	error InvalidTgePercentage();
+	error InvalidVestingPercentage();
+	error SaleClosed();
+	error TokenNotLaunched();
+	error TokenAlreadyLaunched();
+	error AllTokensClaimed();
+	error InvalidBeneficiary();
+	error NotOwner();
+	error VestingScheduleDoesNotExist();
+	error VestingScheduleAlreadyInitialized();
+
+
+	// -----------------------------------------
+	// Constructor
+	// -----------------------------------------
+
+	/// @param _token The token being vested
+	/// @param _treasuryWallet The treasury wallet holding the tokens
+	constructor(IERC20 _token, address _treasuryWallet) {
+		token = _token;
+		_grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+		_grantRole(VESTING_MANAGER_ROLE, msg.sender);
+		_grantRole(PHASE_MANAGER_ROLE, msg.sender);
+		_grantRole(CONTRACT_MANAGER_ROLE, msg.sender);
+		treasuryWallet = _treasuryWallet;
+		tokenLaunch = false;
+		tokenLaunchTime = type(uint256).max;
+		activeSalePhaseId = type(uint256).max;
+	}
+
+	// -----------------------------------------
+	// External/Public Functions
+	// -----------------------------------------
+
+	/// @notice Starts the token launch, enabling vesting schedules to be active
+	function launchToken() external onlyRole(DEFAULT_ADMIN_ROLE) {
+		if (tokenLaunch) revert TokenAlreadyLaunched();
+		tokenLaunch = true;
+		phases[activeSalePhaseId].saleStatus = false;
+		tokenLaunchTime = block.timestamp;
+		emit TokenLaunched(tokenLaunchTime);
+	}
+
+	/// @notice Creates a new vesting schedule for a beneficiary
+	/// @param _beneficiary The address of the beneficiary
+	/// @param _amount The total amount to be vested
+	/// @param phaseId The ID of the phase associated with this vesting
+	/// @param _revocable Indicates if the schedule can be revoked
+	function createVestingSchedule(
+		address _beneficiary,
+		uint256 _amount,
+		uint256 phaseId,
+		bool _revocable
+	)
+	external
+	onlyRole(VESTING_MANAGER_ROLE)
+	whenNotPaused
+	{
+		bytes32 scheduleId = _createVestingSchedule(_beneficiary, _amount, phaseId, _revocable);
+		emit VestingScheduleCreated(scheduleId, _beneficiary, _amount, phaseId, _revocable);
+	}
+
+	/// @notice Revokes a vesting schedule
+	/// @param vestingScheduleId The ID of the vesting schedule to revoke
+	function revoke(bytes32 vestingScheduleId) external onlyRole(VESTING_MANAGER_ROLE) {
+		VestingSchedule storage vestingSchedule = vestingSchedules[vestingScheduleId];
+		if (!vestingSchedule.revocable) revert NotRevocable();
+		if (vestingSchedule.status == Status.REVOKED) revert VestingScheduleWasRevoked();
+
+		vestingSchedule.status = Status.REVOKED;
+		emit VestingScheduleRevoked(vestingScheduleId, vestingSchedule.beneficiary);
+	}
+
+
+	function unRevoke(bytes32 vestingScheduleId) external onlyRole(VESTING_MANAGER_ROLE) {
+		VestingSchedule storage vestingSchedule = vestingSchedules[vestingScheduleId];
+		if (!vestingSchedule.revocable) revert NotRevocable();
+		if (vestingSchedule.status == Status.INITIALIZED) revert VestingScheduleAlreadyInitialized();
+
+		vestingSchedule.status = Status.INITIALIZED;
+		emit VestingScheduleRevoked(vestingScheduleId, vestingSchedule.beneficiary);
+	}
+
+	/// @notice Updates the sale status of a phase
+	/// @param phaseId The ID of the phase to update
+	/// @param status The new sale status
+	function setPhaseSaleStatus(
+		uint256 phaseId,
+		bool status
+	)
+	external
+	onlyRole(PHASE_MANAGER_ROLE)
+	{
+		if (bytes(phases[phaseId].name).length == 0) revert PhaseDoesNotExist();
+
+		if (status) {
+			if (
+				activeSalePhaseId != type(uint256).max &&
+				activeSalePhaseId != phaseId
+			) {
+				phases[activeSalePhaseId].saleStatus = false;
+			}
+			activeSalePhaseId = phaseId;
+		} else if (activeSalePhaseId == phaseId) {
+			activeSalePhaseId = type(uint256).max;
+		}
+
+		phases[phaseId].saleStatus = status;
+		emit PhaseSaleStatusUpdated(phaseId, status);
+	}
+
+	/// @notice Allows beneficiaries to claim vested tokens
+	/// @param vestingScheduleId The ID of the vesting schedule
+	function claimTokens(bytes32 vestingScheduleId) external nonReentrant whenNotPaused {
+
+
+		VestingSchedule storage vestingSchedule = vestingSchedules[vestingScheduleId];
+
+		if (vestingSchedule.amountToVest == 0) revert VestingScheduleDoesNotExist();
+
+		if (vestingSchedule.status == Status.REVOKED) revert VestingScheduleWasRevoked();
+
+		if (msg.sender != vestingSchedule.beneficiary) revert NotOwner();
+		if (!tokenLaunch) revert TokenNotLaunched();
+		if (vestingSchedule.amountToVest <= vestingSchedule.claimedAmount) revert AllTokensClaimed();
+
+		uint256 claimableAmount = _calculateClaimableAmount(vestingSchedule);
+
+
+		if (claimableAmount == 0) revert InsufficientClaimableTokens();
+		vestingSchedule.claimedAmount += claimableAmount;
+		_transferTokens(vestingSchedule.beneficiary, claimableAmount);
+		emit TokensClaimed(vestingScheduleId, vestingSchedule.beneficiary, claimableAmount);
+	}
+
+	/// @notice Creates a new vesting phase
+	/// @param phaseId The ID of the new phase
+	/// @param _name The name of the phase
+	/// @param _cliff The cliff duration (in seconds)
+	/// @param _duration The total duration of the phase (in seconds)
+	/// @param _slicePeriodSeconds The duration of each slice (in seconds)
+	/// @param _tgePercentage The percentage of tokens released at TGE
+	/// @param _vestingPercentagePerSlice The percentage of tokens released per slice
+	function createPhase(
+		uint256 phaseId,
+		string memory _name,
+		uint256 _cliff,
+		uint256 _duration,
+		uint256 _slicePeriodSeconds,
+		uint256 _tgePercentage,
+		uint256 _vestingPercentagePerSlice
+	)
+	external
+	onlyRole(VESTING_MANAGER_ROLE)
+	{
+		if (tokenLaunch) revert TokenAlreadyLaunched();
+		if (bytes(phases[phaseId].name).length != 0) revert PhaseAlreadyExists();
+		if (_duration <= _cliff) revert DurationShorterThanCliff();
+		if (_slicePeriodSeconds == 0 || _slicePeriodSeconds > _duration) revert InvalidSlicePeriod();
+		if (_tgePercentage > 100) revert InvalidTgePercentage();
+
+		uint256 totalSlices = (_duration - _cliff) / _slicePeriodSeconds;
+		if (totalSlices * _vestingPercentagePerSlice + _tgePercentage != 100) revert InvalidVestingPercentage();
+
+		phases[phaseId] = Phase({
+			name: _name,
+			cliff: _cliff,
+			duration: _duration,
+			slicePeriodSeconds: _slicePeriodSeconds,
+			tgePercentage: _tgePercentage,
+			vestingPercentagePerSlice: _vestingPercentagePerSlice,
+			saleStatus: false
+		});
+
+		emit PhaseCreated(
+			phaseId,
+			_name,
+			_cliff,
+			_duration,
+			_slicePeriodSeconds,
+			_tgePercentage,
+			_vestingPercentagePerSlice
+		);
+	}
+
+	/// @notice Pauses the contract, disabling vesting and token claims
+	function pause() external onlyRole(CONTRACT_MANAGER_ROLE) {
+		_pause();
+	}
+
+	/// @notice Unpauses the contract, re-enabling vesting and token claims
+	function unpause() external onlyRole(CONTRACT_MANAGER_ROLE) {
+		_unpause();
+	}
+
+	/// @notice Computes the ID of a vesting schedule for a beneficiary and phase
+	/// @param _beneficiary The address of the beneficiary
+	/// @param phaseId The ID of the phase
+	/// @return scheduleId The computed vesting schedule ID
+	function getVestingScheduleId(
+		address _beneficiary,
+		uint256 phaseId
+	)
+	external
+	pure
+	returns (bytes32 scheduleId)
+	{
+		scheduleId = _createVestingScheduleIdForAddressAndPhaseId(_beneficiary, phaseId);
+	}
+
+	// -----------------------------------------
+	// Internal Functions
+	// -----------------------------------------
+
+	/// @dev Creates a vesting schedule or updates an existing one
+	/// @param _beneficiary The address of the beneficiary
+	/// @param _amount The total amount to vest
+	/// @param _phaseId The ID of the associated phase
+	/// @param _revocable Indicates if the schedule can be revoked
+	/// @return vestingScheduleId The ID of the created or updated vesting schedule
+	function _createVestingSchedule(
+		address _beneficiary,
+		uint256 _amount,
+		uint256 _phaseId,
+		bool _revocable
+	)
+	internal
+	returns (bytes32 vestingScheduleId)
+	{
+		Phase memory phase = phases[_phaseId];
+		if (_beneficiary == address(0)) revert InvalidBeneficiary();
+		if (tokenLaunch) revert TokenAlreadyLaunched();
+		if (bytes(phase.name).length == 0) revert PhaseDoesNotExist();
+		if (!phase.saleStatus) revert SaleClosed();
+		if (_amount == 0) revert InvalidAmount();
+
+		bool _tgeEligible = (phase.tgePercentage > 0);
+
+		vestingScheduleId = _createVestingScheduleIdForAddressAndPhaseId(
+			_beneficiary,
+			_phaseId
+		);
+
+		if (vestingSchedules[vestingScheduleId].amountToVest > 0) {
+			vestingSchedules[vestingScheduleId].amountToVest += _amount;
+		} else {
+			vestingSchedules[vestingScheduleId] = VestingSchedule({
+				beneficiary: _beneficiary,
+				amountToVest: _amount,
+				claimedAmount: 0,
+				phaseId: _phaseId,
+				status: Status.INITIALIZED,
+				revocable: _revocable,
+				tgeEligible: _tgeEligible
+			});
+
+			vestingSchedulesIds.push(vestingScheduleId);
+			vestingSchedulesTotalAmount += _amount;
+		}
+	}
+
+	/// @dev Generates a unique ID for a vesting schedule
+	/// @param _holder The address of the beneficiary
+	/// @param _phaseId The ID of the phase
+	/// @return The computed schedule ID
+	function _createVestingScheduleIdForAddressAndPhaseId(
+		address _holder,
+		uint256 _phaseId
+	)
+	internal
+	pure
+	returns (bytes32)
+	{
+		return keccak256(abi.encodePacked(_holder, _phaseId));
+	}
+
+	/// @dev Calculates the percentage of a given amount
+	/// @param amount The total amount
+	/// @param percentage The percentage to calculate
+	/// @return The calculated percentage of the amount
+	function calculatePercentage(
+		uint256 amount,
+		uint256 percentage
+	)
+	internal
+	pure
+	returns (uint256)
+	{
+		return (amount * percentage) / 100;
+	}
+
+	/// @dev Calculates the claimable token amount for a vesting schedule
+/// @param vestingSchedule The vesting schedule details
+/// @return claimable The amount of tokens that can be claimed
+	function _calculateClaimableAmount(VestingSchedule storage vestingSchedule) internal returns (uint256 claimable) {
+		uint256 currentTime = block.timestamp;
+		Phase memory phase = phases[vestingSchedule.phaseId];
+		uint256 cliffEndTime = tokenLaunchTime + phase.cliff;
+
+		if (currentTime < cliffEndTime) {
+			if (vestingSchedule.tgeEligible) {
+				vestingSchedule.tgeEligible = false;
+				return calculatePercentage(vestingSchedule.amountToVest, phase.tgePercentage);
+			}
+			return 0;
+		}
+
+		if (currentTime >= tokenLaunchTime + phase.duration) {
+			return vestingSchedule.amountToVest - vestingSchedule.claimedAmount;
+		}
+
+		uint256 vestedSlicePeriods = (currentTime - cliffEndTime) / phase.slicePeriodSeconds;
+		uint256 vestedAmount = (vestingSchedule.amountToVest * phase.vestingPercentagePerSlice * vestedSlicePeriods) / 100;
+
+		if (vestingSchedule.tgeEligible) {
+			vestingSchedule.tgeEligible = false;
+			vestedAmount += calculatePercentage(vestingSchedule.amountToVest, phase.tgePercentage);
+		}
+
+		return vestedAmount < vestingSchedule.claimedAmount ? 0 : vestedAmount - vestingSchedule.claimedAmount;
+	}
+
+	/// @dev Transfers tokens from the treasury wallet to a beneficiary
+	/// @param beneficiary The address receiving the tokens
+	/// @param amount The amount of tokens to transfer
+	function _transferTokens(address beneficiary, uint256 amount) internal {
+		token.safeTransferFrom(treasuryWallet, beneficiary, amount);
+	}
+}
